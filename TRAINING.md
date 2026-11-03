@@ -57,10 +57,11 @@ is `scripted-basestock`. The review must match the actual attempt policy, source
 revision, game version, and selected seats. Qualification alone does not authorize labels.
 The importer retains generation evidence and owns the scenario-family split. Inspect
 its `prompt_wordings` counts before using a mixed corpus; raw wording coverage is insufficient.
-For prompt seed zero, seeds 1–10 retain only `plain` and `questions` in training under
-the default 20% hash split. Seeds 1–20 retain all five training wordings, with 1,584
-training and 1,296 validation targets across all four seats. Other ranges and target
-filters need their own coverage check.
+Historical seed-based exports with prompt seed zero retained only `plain` and
+`questions` in training for seeds 1–10. Seeds 1–20 retained all five training
+wordings, with 1,584 training and 1,296 validation targets across all four seats.
+Those counts do not qualify the physical-demand split. Recompute target counts
+and training-wording coverage for each physically grouped export and target filter.
 
 ```sh
 nim r -d:release --path:src tools/export_posttrain.nim \
@@ -105,7 +106,8 @@ labels. A complete game returns each stage's native negative cost as score.
 The exporter writes `trajectories.jsonl`: complete engine-owned private
 trajectories with exact seat observations, prompts, teacher proposals, applied
 orders, scores, source commit, and game version. Output directories use mode
-0700 and files use 0600. Seed families use `bullwhip-<seed>`, matching runtime.
+0700 and files use 0600. Families use the simulator-owned physical-demand identity
+defined above, matching runtime; distinct seed labels can share one family.
 These local scripted basestock labels do not provide hosted model or learner
 sampling evidence. Review dataset content before training.
 
