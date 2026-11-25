@@ -146,13 +146,21 @@ for mode in ("accepted", "invalid", "sampled", "greedy-null", "greedy-tokens", "
                             "COWORLD_PLAYER_WS_URL": f"ws://127.0.0.1:{port}/player?slot={seat}&token=t{seat}",
                         }
                         processes.append(subprocess.Popen([PLAYER], cwd=ROOT, env=player_env, stdout=log, stderr=log))
-                    for process in processes:
+                    failed_mode = mode in {"invalid", "provider-error"}
+                    assert processes[0].wait(timeout=40) == (1 if failed_mode else 0), (output / "game.log").read_text()
+                    for process in processes[1:]:
                         assert process.wait(timeout=40) == 0, (output / "game.log").read_text()
                     events = [json.loads(line) for line in (output / "trajectory.jsonl").read_text().splitlines()]
-                    assert len(events[:-1]) == 16 and events[-1]["status"] == "completed"
-                    assert events[-1]["outcome"]["weeks"] == 4
+                    if failed_mode:
+                        assert len(events[:-1]) == 4 and events[-1]["status"] == "failed"
+                        assert events[-1]["participant_outcomes"] is None
+                        assert not (output / "results.json").exists()
+                        assert not (output / "replay.json").exists()
+                    else:
+                        assert len(events[:-1]) == 16 and events[-1]["status"] == "completed"
+                        assert events[-1]["outcome"]["weeks"] == 4
                     recorded = set()
-                    fallback = 0
+                    rejected = 0
                     for decision in events[:-1]:
                         assert decision["visibility"] == "private"
                         for attempt in decision["attempts"]:
@@ -186,15 +194,22 @@ for mode in ("accepted", "invalid", "sampled", "greedy-null", "greedy-tokens", "
                                 assert attempt["sampled_token_ids"] == [3, 4]
                                 assert attempt["behavior_logprobs"] == ([-0.5, -0.3] if mode == "sampled" else None)
                                 assert attempt["model_identity"] == "a" * 64
-                        if decision["action_status"] == "fallback":
-                            fallback += 1
-                            assert decision["selected_attempt_id"] is None and len(decision["attempts"]) == 2
+                        if failed_mode:
+                            assert decision["selected_attempt_id"] is None
+                            assert decision["executed_action"] is None
+                            if decision["seat"] == "0":
+                                rejected += 1
+                                assert decision["action_status"] == "rejected" and len(decision["attempts"]) == 2
+                            else:
+                                assert decision["action_status"] == "missing" and len(decision["attempts"]) == 1
                         else:
+                            assert decision["action_status"] == "accepted"
                             assert decision["selected_attempt_id"] == decision["attempts"][-1]["attempt_id"]
                     assert recorded == set(calls)
-                    assert fallback == (4 if mode in {"invalid", "provider-error"} else 0)
-                    replay = (output / "replay.json").read_text()
-                    public = replay + (output / "game.log").read_text()
+                    assert rejected == (1 if failed_mode else 0)
+                    public = (output / "game.log").read_text()
+                    if not failed_mode:
+                        public += (output / "replay.json").read_text()
                     for secret in [
                         "private-notebook-fixture",
                         "private-strategy-fixture",

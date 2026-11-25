@@ -16,8 +16,7 @@ const Templates = [
 proc renderVariantPrompt*(config: GameConfig, name, role, downstream, upstream, talk: string): string =
   result = Templates[ord(config.selectedPromptVariant) - 1] % [name, role, downstream, upstream, talk]
   result.add("\nOUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no\n" &
-    "analysis, no explanation, no markdown fences, no text before or after\n" &
-    "the object. Your reply must begin with the character { and end with }.")
+    "analysis, no explanation, no extra text before or after the object.")
 
 proc promptMetadata*(config: GameConfig, system, user: string): JsonNode =
   %*{"bank": PromptBankVersion, "variant": $config.selectedPromptVariant,
