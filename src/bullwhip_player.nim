@@ -14,16 +14,13 @@ when isMainModule:
   var prompt = getEnv("PLAYER_PROMPT")
   if prompt.len == 0:
     prompt = DefaultOperatorPrompt
-  let scriptedEnv = getEnv("PLAYER_SCRIPTED").strip()
-  ## Scripted registrations select the game-owned private-view policy.
+  let scriptedEnv = getEnv("PLAYER_SCRIPTED").strip().toLowerAscii()
+  ## Scripted registrations select the game-owned private-view baseline.
   let scripted =
-    if scriptedEnv.len == 0 or scriptedEnv.toLowerAscii() in
-        ["0", "false", "no"]:
-      ""
-    elif scriptedEnv.toLowerAscii() in ["1", "true", "yes"]:
-      "basestock"
-    else:
-      scriptedEnv.toLowerAscii()
+    case scriptedEnv
+    of "": ""
+    of "basestock", "mirror": scriptedEnv
+    else: quit("unknown PLAYER_SCRIPTED baseline: " & scriptedEnv, 1)
 
   let timeout = parseFloat(getEnv("COWORLD_TIMEOUT_SECONDS", "1200"))
   if timeout <= 0 or classify(timeout) in {fcNan, fcInf, fcNegInf}:

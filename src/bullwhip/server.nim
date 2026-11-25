@@ -67,7 +67,9 @@ type
     latestDecisions: Table[int, string]
     startedAttempts, completedAttempts: Table[string, JsonNode]
     externalRejections: seq[int]
-    externalFallback: seq[bool]
+    externalFailed: seq[bool]
+    externalFailureReason: seq[string]
+    seatFailed: seq[bool]
     stopId: string
     stopIssuedAt, acknowledgementDeadline: MonoTime
     stoppedSlots: HashSet[int]
@@ -284,6 +286,19 @@ proc issueExternalDecision(gs: var GameState, seat: int, retry: bool) =
 proc waitUntil(deadline: MonoTime) =
   while getMonoTime() < deadline and not interruptionRequested(): sleep(10)
 
+proc attachPromptAttempts(observation: JsonNode, attempts: seq[DecisionAttempt],
+    config: GameConfig): JsonNode =
+  result = copy(observation)
+  result["prompt_attempts"] = newJArray()
+  for attempt in attempts:
+    if attempt.prompt.kind == JArray and attempt.prompt.len == 2 and
+        attempt.prompt[0]{"role"}.getStr() == "system" and
+        attempt.prompt[1]{"role"}.getStr() == "user":
+      result["prompt_attempts"].add(%*{
+        "attempt_id": attempt.attemptId,
+        "prompt_template": promptMetadata(config,
+          attempt.prompt[0]["content"].getStr(), attempt.prompt[1]["content"].getStr())})
+
 proc finishEpisode(runtimeConfig: RuntimeConfig, failed = false) =
   ## All game-owned inference workers have returned and joined before entry.
   let cleanupDeadline = getMonoTime() + initDuration(seconds = 5)
@@ -334,41 +349,80 @@ proc finishEpisode(runtimeConfig: RuntimeConfig, failed = false) =
               attempt.parsedAction = parsed
               attempt.accepted = accepted
               attempt.rejectionReason = rejection
-        var observation = copy(record.observation)
-        observation["prompt_attempts"] = newJArray()
-        for attempt in attempts:
-          if attempt.prompt.kind == JArray and attempt.prompt.len == 2 and
-              attempt.prompt[0]{"role"}.getStr() == "system" and
-              attempt.prompt[1]{"role"}.getStr() == "user":
-            observation["prompt_attempts"].add(%*{
-              "attempt_id": attempt.attemptId,
-              "prompt_template": promptMetadata(state.config,
-                attempt.prompt[0]["content"].getStr(), attempt.prompt[1]["content"].getStr())})
+        let observation = attachPromptAttempts(record.observation, attempts, state.config)
+        let seatIdx = parseInt(record.seat)
+        let fbOrigin =
+          if record.decision.selectedAttemptId.isSome: none(string)
+          elif state.scripted[seatIdx] == skBasestock: some("engine-basestock")
+          elif state.scripted[seatIdx] == skMirror: some("engine-mirror")
+          else: none(string)
         state.trajectory.recordDecision(record.id, record.seat,
           observation, attempts,
           record.decision.selectedAttemptId, decisionJson(record.decision),
           (if record.decision.selectedAttemptId.isSome: asAccepted else: asFallback),
-          terminal = record.terminal, fallbackOrigin = (if record.decision.selectedAttemptId.isSome:
-            none(string) else: some("engine-basestock")))
+          terminal = record.terminal, fallbackOrigin = fbOrigin)
+      var recordedCurrentWeek = initHashSet[int]()
       for seat, attempts in state.nativeAttempts:
         var missing: seq[DecisionAttempt]
+        var anyRejected = false
         for attempt in attempts:
           if attempt.attemptId notin represented:
+            represented.incl(attempt.attemptId)
             var unapplied = attempt
             unapplied.accepted = false
-            unapplied.rejectionReason = some("native attempt never reached an applied engine action")
+            if unapplied.rejectionReason.isSome:
+              anyRejected = true
+            else:
+              unapplied.rejectionReason = some("native attempt never reached an applied engine action")
             missing.add(unapplied)
         if missing.len > 0:
+          recordedCurrentWeek.incl(seat)
+          let status = if failed and anyRejected: asRejected else: asMissing
           state.trajectory.recordDecision($state.currentWeek & "-" & $seat,
-            $seat, state.currentObservations[seat], missing, none(string),
-            newJNull(), asMissing, terminal = true)
+            $seat, attachPromptAttempts(state.currentObservations[seat], missing, state.config),
+            missing, none(string), newJNull(), status, terminal = true)
+      for seat, attempts in state.externalAttempts:
+        var missing: seq[DecisionAttempt]
+        var anyRejected = false
+        for attempt in attempts:
+          if attempt.attemptId notin represented:
+            represented.incl(attempt.attemptId)
+            var unapplied = attempt
+            for _, evidence in state.startedAttempts:
+              if evidence["attempt_id"] == %unapplied.attemptId:
+                let parsed = unapplied.parsedAction
+                let rejection = unapplied.rejectionReason
+                unapplied = readAttemptEvidence(evidence)
+                unapplied.parsedAction = parsed
+                if rejection.isSome: unapplied.rejectionReason = rejection
+            unapplied.accepted = false
+            if unapplied.rejectionReason.isSome:
+              anyRejected = true
+            else:
+              unapplied.rejectionReason = some("external attempt never reached an applied engine action")
+            missing.add(unapplied)
+        if missing.len > 0:
+          recordedCurrentWeek.incl(seat)
+          let status = if failed and anyRejected: asRejected else: asMissing
+          state.trajectory.recordDecision($state.currentWeek & "-" & $seat,
+            $seat, attachPromptAttempts(state.currentObservations[seat], missing, state.config),
+            missing, none(string), newJNull(), status, terminal = true)
+      if failed:
+        for seat in 0 ..< state.seatFailed.len:
+          if state.seatFailed[seat] and seat notin recordedCurrentWeek and
+              not state.currentObservations[seat].isNil:
+            recordedCurrentWeek.incl(seat)
+            state.trajectory.recordDecision($state.currentWeek & "-" & $seat,
+              $seat, attachPromptAttempts(state.currentObservations[seat], @[], state.config),
+              @[], none(string), newJNull(), asMissing, terminal = true)
       for id, evidence in state.startedAttempts:
         var attempt = readAttemptEvidence(evidence)
         if attempt.attemptId notin represented:
-          attempt.rejectionReason = some("issued native attempt never reached an applied engine action")
+          if attempt.rejectionReason.isNone:
+            attempt.rejectionReason = some("issued native attempt never reached an applied engine action")
           state.trajectory.recordDecision(id, $state.issuedSeats[id],
-            state.issuedObservations[id], @[attempt], none(string), newJNull(),
-            asMissing, terminal = true)
+            attachPromptAttempts(state.issuedObservations[id], @[attempt], state.config),
+            @[attempt], none(string), newJNull(), asMissing, terminal = true)
       var outcomes = newJObject()
       for slot in 0 ..< Seats: outcomes[$slot] = results["scores"][slot]
       var privateOutcome = copy(results)
@@ -492,17 +546,20 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         for index, seat in seats: state.currentObservations[seat] = observations[index]
         for seat in seats:
           state.nativeAttempts[seat] = @[]
+          state.seatFailed[seat] = false
           if external[seat]:
             state.awaiting[seat] = true
             state.actions[seat] = nil
             state.externalAttempts[seat] = @[]
             state.externalRejections[seat] = 0
-            state.externalFallback[seat] = false
+            state.externalFailed[seat] = false
+            state.externalFailureReason[seat] = ""
             state.issueExternalDecision(seat, retry = false)
 
+      var nativeSeats: seq[int]
       for seat in seats:
-        if external[seat]:
-          scripted[seat] = skBasestock
+        if not external[seat]:
+          nativeSeats.add(seat)
 
       ## Game-owned native requests (one parallel batch for the week) run
       ## outside the lock on a snapshot; only this thread mutates the sim,
@@ -510,23 +567,34 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       proc beforeCall(slot: int, attempt: DecisionAttempt) {.gcsafe.} =
         {.gcsafe.}:
           withLock stateLock: state.nativeAttempts[slot].add(attempt)
-      var decisions = client.decideAll(simCopy, seats, prompts, scripted,
+      let nativeDecisions = client.decideAll(simCopy, nativeSeats, prompts, scripted,
         phaseDeadline, beforeCall)
+      var decisions = newSeq[Decision](seats.len)
+      var nativePos = 0
+      for index, seat in seats:
+        if not external[seat]:
+          decisions[index] = nativeDecisions[nativePos]
+          inc nativePos
       withLock stateLock:
         for index, seat in seats:
-          if not external[seat]: state.nativeAttempts[seat] = decisions[index].attempts
+          if not external[seat]:
+            state.nativeAttempts[seat] = decisions[index].attempts
+            if decisions[index].failed:
+              state.seatFailed[seat] = true
 
       while getMonoTime() < phaseDeadline and not interruptionRequested():
         var waiting = false
         withLock stateLock:
           for seat in seats:
-            if external[seat] and state.actions[seat].isNil:
+            if external[seat] and state.actions[seat].isNil and not state.externalFailed[seat]:
               waiting = true
         if not waiting:
           break
         waitUntil(min(phaseDeadline, getMonoTime() + initDuration(milliseconds = 20)))
 
       if interruptionRequested(): break
+      var failedSeat = -1
+      var failureReason = ""
       withLock stateLock:
         for index, seat in seats:
           if external[seat]:
@@ -536,12 +604,27 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               doAssert proposal.kind == pkAccepted
               decisions[index] = proposal.decision
               decisions[index].attempts = state.externalAttempts[seat]
-              decisions[index].selectedAttemptId = if state.externalFallback[seat]: none(string)
-                else: some(state.externalAttempts[seat][^1].attemptId)
+              decisions[index].selectedAttemptId = some(state.externalAttempts[seat][^1].attemptId)
+            elif state.externalFailed[seat]:
+              state.seatFailed[seat] = true
+              decisions[index] = Decision(failed: true,
+                failureReason: state.externalFailureReason[seat],
+                attempts: state.externalAttempts[seat])
             else:
-              echo "bullwhip: seat ", seat,
-                " missed action deadline; using base-stock fallback"
-              decisions[index].attempts = state.externalAttempts[seat]
+              state.externalFailed[seat] = true
+              state.externalFailureReason[seat] = "missed action deadline"
+              state.seatFailed[seat] = true
+              decisions[index] = Decision(failed: true,
+                failureReason: "missed action deadline",
+                attempts: state.externalAttempts[seat])
+          if decisions[index].failed and failedSeat < 0:
+            failedSeat = seat
+            failureReason = decisions[index].failureReason
+
+      if failedSeat >= 0:
+        echo "bullwhip: seat ", failedSeat, " failed to provide a valid order: ", failureReason
+        raise newException(BullwhipError,
+          "seat " & $failedSeat & " failed: " & failureReason)
 
       withLock stateLock:
         for index, seat in seats:
@@ -559,13 +642,13 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             if decision.selectedAttemptId.isSome:
               decision.attempts[^1].accepted = false
               decision.attempts[^1].rejectionReason = some(error.msg)
-            echo "bullwhip: reply rejected; using scripted fallback"
-            let fallback = scriptedAction(state.sim, seat, skBasestock)
-            state.sim.applyOrder(seat, fallback.order, "", "", true)
-            decision.order = fallback.order
-            decision.say = ""
-            decision.notes = ""
-            decision.selectedAttemptId = none(string)
+            if external[seat]:
+              state.externalAttempts[seat] = decision.attempts
+            else:
+              state.nativeAttempts[seat] = decision.attempts
+            state.seatFailed[seat] = true
+            echo "bullwhip: seat ", seat, " order rejected by engine: ", error.msg
+            raise error
           state.records.add(PendingDecision(id: $simCopy.week & "-" & $seat,
             seat: $seat, observation: observations[index], decision: decision,
             terminal: state.sim.done))
@@ -772,11 +855,6 @@ proc websocketHandler(
               inc state.externalRejections[slot]
               attempt.rejectionReason = some(proposal.reason)
               retry = state.externalRejections[slot] == 1 and source != "fallback"
-              if not retry:
-                chosen = scriptedAction(observation, skBasestock)
-                state.externalFallback[slot] = true
-                websocket.send($(%*{"type": "consumed_rejection", "decision_id": id,
-                  "reason": proposal.reason, "action": decisionJson(chosen)}))
             var stored = false
             for existing in state.externalAttempts[slot].mitems:
               if existing.attemptId == attempt.attemptId:
@@ -786,6 +864,11 @@ proc websocketHandler(
             if retry:
               state.issueExternalDecision(slot, retry = true)
               return
+            if proposal.kind != pkAccepted:
+              state.externalFailed[slot] = true
+              state.externalFailureReason[slot] = proposal.reason
+              state.awaiting[slot] = false
+              return
             state.actions[slot] = decisionJson(chosen)
         elif payload{"type"}.getStr() == "prompt":
           var prompt = payload{"prompt"}.getStr()
@@ -793,10 +876,9 @@ proc websocketHandler(
             prompt = prompt.runeSubStr(0, MaxPromptLen)
           let node = payload{"scripted"}
           let scripted =
-            if node.isNil: skNone
-            elif node.kind == JBool: (if node.getBool(): skBasestock
-              else: skNone)
-            else: parseScriptKind(node.getStr())
+            if node.isNil or (node.kind == JBool and not node.getBool()): skNone
+            elif node.kind == JString: parseScriptKind(node.getStr())
+            else: raise newException(BullwhipError, "scripted must be false or a canonical baseline name")
           withLock stateLock:
             if state.started or state.stopping or state.finished or state.ready[slot]:
               raise newException(BullwhipError, "player registration is frozen")
@@ -915,7 +997,9 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.currentObservations = newSeq[JsonNode](config.players.len)
   state.scripted = newSeq[ScriptKind](config.players.len)
   state.externalRejections = newSeq[int](config.players.len)
-  state.externalFallback = newSeq[bool](config.players.len)
+  state.externalFailed = newSeq[bool](config.players.len)
+  state.externalFailureReason = newSeq[string](config.players.len)
+  state.seatFailed = newSeq[bool](config.players.len)
   runtimeConfigGlobal = runtimeConfig
   if getEnv(CogameSaveTrajectoryUriEnv).len > 0:
     state.trajectory = newDecisionTrajectory(getEnv("COWORLD_EPISODE_ID"),

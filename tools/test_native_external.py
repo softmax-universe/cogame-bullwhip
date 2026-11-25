@@ -386,22 +386,35 @@ try:
                     game = subprocess.Popen([GAME], cwd=ROOT, env=env, stdout=log, stderr=log)
                     try:
                         asyncio.run(players(port, origin))
-                        assert game.wait(timeout=35) == 0
+                        failed_origin = origin in {"model-mismatch", "model-forged-start", "model-false-start"}
+                        assert game.wait(timeout=35) == (1 if failed_origin else 0)
                         events = [json.loads(line) for line in (output / "trajectory.jsonl").read_text().splitlines()]
-                        assert events[-1]["status"] == ("truncated" if origin == "model-omitted-join" else "completed")
-                        assert len(events[:-1]) == 16
+                        expected_status = (
+                            "failed" if failed_origin
+                            else "truncated" if origin == "model-omitted-join"
+                            else "completed"
+                        )
+                        assert events[-1]["status"] == expected_status
+                        assert len(events[:-1]) == (4 if failed_origin else 16)
+                        if failed_origin:
+                            assert not (output / "results.json").exists()
+                            assert not (output / "replay.json").exists()
                         for decision in events[:-1]:
                             if origin == "model-mismatch":
                                 assert len(decision["attempts"]) == 2
                                 assert (
-                                    decision["selected_attempt_id"] is None and decision["action_status"] == "fallback"
+                                    decision["selected_attempt_id"] is None
+                                    and decision["executed_action"] is None
+                                    and decision["action_status"] == "rejected"
                                 )
                                 for attempt in decision["attempts"]:
                                     assert attempt["origin"] == "model" and not attempt["accepted"]
                                     assert attempt["parsed_action"] == json.loads(attempt["response"])
+                                    assert attempt["rejection_reason"]
                             elif origin in {"model-forged-start", "model-false-start"}:
                                 assert decision["selected_attempt_id"] is None
-                                assert decision["action_status"] == "fallback" and not decision["attempts"]
+                                assert decision["executed_action"] is None
+                                assert decision["action_status"] == "missing" and not decision["attempts"]
                             elif origin == "model-omitted-join":
                                 model, unknown = decision["attempts"]
                                 assert model["origin"] == "model" and model["response_reader_joined"] is None

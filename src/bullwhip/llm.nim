@@ -7,7 +7,7 @@
 ## credentials and direct provider transports are not part of this runtime.
 
 import
-  std/[base64, json, math, monotimes, options, os, parsejson, parseutils, sets, strutils, tables, unicode],
+  std/[base64, json, math, monotimes, options, os, parsejson, sets, strutils, tables, unicode],
   bitworld/[decision_trajectory, native_http, native_stop],
   native_batch,
   sim,
@@ -31,6 +31,8 @@ type
     say*: string
     notes*: string      ## "" when the reply carried none
     scripted*: bool
+    failed*: bool
+    failureReason*: string
     attempts*: seq[DecisionAttempt]
     selectedAttemptId*: Option[string]
 
@@ -52,12 +54,12 @@ type
     disabled*: bool
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"basestock" play the
-  ## base-stock bot, "mirror" the pass-through bot, anything else nothing.
+  ## Canonical scripted baseline selectors: "basestock", "mirror", or "".
   case text.strip().toLowerAscii()
-  of "1", "true", "yes", "basestock", "base-stock": skBasestock
-  of "mirror", "passthrough", "pass-through": skMirror
-  else: skNone
+  of "": skNone
+  of "basestock": skBasestock
+  of "mirror": skMirror
+  else: raise newException(BullwhipError, "unknown scripted baseline: " & text)
 
 proc newLlmClient*(config: GameConfig): LlmClient =
   result = LlmClient(
@@ -78,7 +80,7 @@ proc newLlmClient*(config: GameConfig): LlmClient =
 # ---- Scripted baselines -----------------------------------------------------
 
 proc scriptedAction*(observation: JsonNode, kind: ScriptKind): Decision =
-  ## Intentional teacher and engine fallback both consume the private view.
+  ## Explicit scripted baselines consume only the seat's private view.
   result.scripted = true
   result.order = if kind == skMirror: observation["seat"]["incoming"].getInt()
     else: baseStockOrder(observation)
@@ -160,8 +162,7 @@ Rules:
   to keep track of what you have on order and what you believe demand is.
 
 OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no
-analysis, no explanation, no markdown fences, no text before or after
-the object. Your reply must begin with the character { and end with }."""
+analysis, no explanation, no extra text before or after the object."""
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
@@ -192,16 +193,16 @@ proc userPrompt*(view: JsonNode, prompt: string, retry = false): string =
   result.add("YOUR NOTES FROM EARLIER WEEKS:\n" &
     (if view["notes"].getStr().len > 0: view["notes"].getStr() else: "(none)") & "\n\n")
   result.add(operatorBlock(prompt))
-  result.add("Reply with ONLY {\"order\": 8" &
-    (if view["talk"].getBool(): ", \"say\": \"…\"" else: "") &
-    ", \"notes\": \"…\"} — order is a whole number of units, 0 to " &
-    $MaxOrder & (if view["talk"].getBool(): "; say at most " & $MaxSayLen &
+  result.add("Reply with ONLY one JSON object, for example {\"order\": 8" &
+    (if view["talk"].getBool(): ", \"say\": \"steady demand around 8\"" else: "") &
+    ", \"notes\": \"on order 8\"} — order is an integer from 0 to " &
+    $MaxOrder & (if view["talk"].getBool(): "; say is a string of at most " & $MaxSayLen &
       " characters (or \"\")" else: "") &
-    "; notes at most " & $MaxNotesLen & " characters.")
+    "; notes is a string of at most " & $MaxNotesLen & " characters.")
 
   if retry:
     result.add("\nYour previous reply was invalid. Respond with ONLY " &
-      "the requested JSON object, with \"order\" a whole number 0.." &
+      "the requested JSON object, with \"order\" an integer from 0 to " &
       $MaxOrder & ".")
 
 proc decisionView*(sim: Sim, seat: int, prompt: string, retry = false): JsonNode =
@@ -369,38 +370,52 @@ proc cleanText*(text: string, limit: int): string =
 proc decisionJson*(decision: Decision): JsonNode =
   %*{"order": decision.order, "say": decision.say, "notes": decision.notes}
 
+proc unwrapMarkdownJsonFence(text: string): tuple[ok: bool, body: string] =
+  let trimmed = text.strip()
+  if not trimmed.startsWith("```"):
+    return (true, trimmed)
+  let firstNewline = trimmed.find('\n')
+  if firstNewline < 0 or not trimmed.endsWith("```"):
+    return (false, "")
+  let lang = trimmed[3 ..< firstNewline].strip().toLowerAscii()
+  if lang.len > 0 and lang != "json":
+    return (false, "")
+  let inner = trimmed[firstNewline + 1 ..< trimmed.len - 3].strip()
+  if inner.len == 0:
+    return (false, "")
+  (true, inner)
+
 proc parseProposal*(text: string, observation: JsonNode): Proposal =
   ## Domain validation returns a typed result; unexpected failures still crash.
-  let first = text.find('{')
-  let last = text.rfind('}')
-  if first < 0 or last <= first:
-    return Proposal(kind: pkRejected, reason: "no JSON object in response")
-  let body = text[first .. last]
+  let unwrapped = unwrapMarkdownJsonFence(text)
+  if not unwrapped.ok or not unwrapped.body.startsWith("{"):
+    return Proposal(kind: pkRejected, reason: "response must be a single JSON object")
   var payload: JsonNode
   try:
-    payload = parseJson(body)
+    payload = parseJson(unwrapped.body)
   except JsonParsingError as error:
     return Proposal(kind: pkRejected, reason: error.msg)
   if payload.kind != JObject or not payload.hasKey("order"):
     return Proposal(kind: pkRejected, reason: "no order in response")
   let node = payload["order"]
-  var number: float
-  case node.kind
-  of JInt: number = float(node.getBiggestInt())
-  of JFloat: number = node.getFloat()
-  of JString:
-    let value = node.getStr().strip()
-    if parseutils.parseFloat(value, number) != value.len or value.len == 0:
-      return Proposal(kind: pkRejected, reason: "order is not a number")
-  else:
-    return Proposal(kind: pkRejected, reason: "order must be a number")
-  if number.classify in {fcNan, fcInf, fcNegInf} or round(number) < 0 or round(number) > MaxOrder.float:
+  if node.kind != JInt:
+    return Proposal(kind: pkRejected, reason: "order must be an integer")
+  let orderVal = node.getBiggestInt()
+  if orderVal < 0 or orderVal > MaxOrder:
     return Proposal(kind: pkRejected, reason: "order outside allowed bounds")
-  var decision = Decision(order: int(round(number)),
-    notes: cleanText(payload{"notes"}.getStr(), MaxNotesLen),
-    say: cleanText(payload{"say"}.getStr(), MaxSayLen).replace("\n", " "))
-  if not observation["talk"].getBool(): decision.say = ""
-  Proposal(kind: pkAccepted, decision: decision)
+  var notesText = ""
+  if payload.hasKey("notes") and payload["notes"].kind != JNull:
+    if payload["notes"].kind != JString:
+      return Proposal(kind: pkRejected, reason: "notes must be a string")
+    notesText = cleanText(payload["notes"].getStr(), MaxNotesLen)
+  var sayText = ""
+  if payload.hasKey("say") and payload["say"].kind != JNull:
+    if payload["say"].kind != JString:
+      return Proposal(kind: pkRejected, reason: "say must be a string")
+    sayText = cleanText(payload["say"].getStr(), MaxSayLen).replace("\n", " ")
+  if not observation["talk"].getBool(): sayText = ""
+  Proposal(kind: pkAccepted, decision: Decision(order: int(orderVal),
+    notes: notesText, say: sayText))
 
 proc decideAll*(client: LlmClient, sim: Sim, seats: seq[int],
     prompts: seq[string], scripted: seq[ScriptKind], deadline: MonoTime,
@@ -409,9 +424,11 @@ proc decideAll*(client: LlmClient, sim: Sim, seats: seq[int],
   result = newSeq[Decision](seats.len)
   var open: seq[int]
   for index, seat in seats:
-    if scripted[seat] != skNone or client.disabled:
-      result[index] = scriptedAction(sim, seat,
-        (if scripted[seat] == skNone: skBasestock else: scripted[seat]))
+    if scripted[seat] != skNone:
+      result[index] = scriptedAction(sim, seat, scripted[seat])
+    elif client.disabled:
+      result[index] = Decision(failed: true,
+        failureReason: "native model seat requires COWORLD_LLM_ENDPOINT")
     else: open.add(index)
   for attempt in 0 .. 1:
     if open.len == 0 or client.disabled or interruptionRequested() or getMonoTime() >= deadline:
@@ -461,5 +478,13 @@ proc decideAll*(client: LlmClient, sim: Sim, seats: seq[int],
     open = stillOpen
   for index in open:
     let attempts = result[index].attempts
-    result[index] = scriptedAction(sim, seats[index], skBasestock)
-    result[index].attempts = attempts
+    let reason =
+      if attempts.len > 0 and attempts[^1].rejectionReason.isSome:
+        attempts[^1].rejectionReason.get()
+      elif client.disabled:
+        "native inference disabled"
+      elif interruptionRequested():
+        "native decision interrupted"
+      else:
+        "native decision missed deadline"
+    result[index] = Decision(failed: true, failureReason: reason, attempts: attempts)

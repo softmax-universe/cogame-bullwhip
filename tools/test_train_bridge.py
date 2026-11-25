@@ -43,11 +43,13 @@ for seed in ("language-1", "language-2"):
         retry_prompt = rejected.observation.messages[-1].content
         assert retry_prompt.startswith(first_prompt)
         assert "Your previous reply was invalid" in retry_prompt
-        expected_fallback = json.loads(bridge.teacher())
-        consumed = bridge.step(observation.decision_id, "{invalid again}")
-        assert consumed.kind == "consumed_rejection"
-        assert consumed.action == expected_fallback
-        observation = consumed.observation
+        rejected2 = bridge.step(observation.decision_id, "{invalid again}")
+        assert rejected2.kind == "rejected"
+        assert rejected2.observation.decision_id == observation.decision_id
+        explicit_zero = bridge.step(observation.decision_id, '{"order": 0}')
+        assert explicit_zero.kind == "accepted"
+        assert explicit_zero.action == {"order": 0, "say": "", "notes": ""}
+        observation = explicit_zero.observation
         decisions = 1
         while not isinstance(observation, Terminal):
             sampled = bridge.teacher()
@@ -57,7 +59,7 @@ for seed in ("language-1", "language-2"):
             observation = result.observation
             decisions += 1
         assert decisions == 4 * 36
-        print(seed, decisions, "complete language decisions including consumed fallback")
+        print(seed, decisions, "complete language decisions with strict rejection and explicit zero")
 
 
 # The JSON token scanner used to accept several complete roots, then parseJson

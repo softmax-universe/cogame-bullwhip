@@ -146,18 +146,19 @@ for mode in ("accepted", "retry", "forged-start", "missing-ack", "disconnected")
             else:
                 raise AssertionError("game did not start")
             asyncio.run(players(port, mode, decisions, receipts))
-            assert process.wait(timeout=10) == 0
+            assert process.wait(timeout=10) == (1 if mode == "disconnected" else 0)
         finally:
             if process.poll() is None:
                 process.terminate()
             process.wait(timeout=5)
     events = [json.loads(line) for line in (output / "trajectory.jsonl").read_text().splitlines()]
     unresolved = mode in {"missing-ack", "disconnected"}
-    assert events[-1]["status"] == ("truncated" if unresolved else "completed")
+    expected_status = "failed" if mode == "disconnected" else ("truncated" if mode == "missing-ack" else "completed")
+    assert events[-1]["status"] == expected_status
     assert (output / "results.json").exists() == (not unresolved)
     assert (output / "replay.json").exists() == (not unresolved)
     assert receipts == ({1, 2, 3} if unresolved else {0, 1, 2, 3})
-    assert len(events) == 17
+    assert len(events) == (9 if mode == "disconnected" else 17)
     for decision in events[:-1]:
         attempts = decision["attempts"]
         assert all(attempt["origin"] == "unknown" for attempt in attempts)
