@@ -595,6 +595,7 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       if interruptionRequested(): break
       var failedSeat = -1
       var failureReason = ""
+      var playerError = false
       withLock stateLock:
         for index, seat in seats:
           if external[seat]:
@@ -620,9 +621,16 @@ proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
           if decisions[index].failed and failedSeat < 0:
             failedSeat = seat
             failureReason = decisions[index].failureReason
+            let attempts = decisions[index].attempts
+            playerError = attempts.len > 0 and attempts[^1].response.kind == JString
 
       if failedSeat >= 0:
         echo "bullwhip: seat ", failedSeat, " failed to provide a valid order: ", failureReason
+        writeArtifact(getEnv("COGAME_PLAYER_FAILURE_URI"),
+          $(%*{"kind": (if playerError: "player_error" else: "episode_inconclusive"),
+            "failed_policy_index": failedSeat,
+            "message": (if playerError: "Player submitted an invalid order" else: "Player could not submit an order")}),
+          "application/json", "COGAME_PLAYER_FAILURE_METHOD", getMonoTime() + initDuration(seconds = 5))
         raise newException(BullwhipError,
           "seat " & $failedSeat & " failed: " & failureReason)
 
