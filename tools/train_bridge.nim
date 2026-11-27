@@ -12,7 +12,6 @@ proc seedOf(value: string): int =
 
 var languageMode = false
 var operatorPrompt = DefaultOperatorPrompt
-var rejectedAttempts = 0
 
 proc decision(game: Sim, id, seat: int, retry = false): JsonNode =
   let observation = decisionView(game, seat, operatorPrompt, retry)
@@ -91,7 +90,6 @@ when isMainModule:
       config = sampleEpisode(config)
       game = initSim(config)
       id = 0
-      rejectedAttempts = 0
       seat = game.pendingSeats()[0]
       # Private split audit only: never attach hidden state to a decision.
       let family = game.physicalScenario()
@@ -132,22 +130,15 @@ when isMainModule:
       doAssert not game.done and request["decision_id"].getInt() == id
       let view = observationJson(game, seat)
       let proposal = parseProposal(request["response"].getStr(), view)
-      var parsed: Decision
-      var consumed = false
       if proposal.kind == pkRejected:
-        inc rejectedAttempts
-        if rejectedAttempts == 1:
-          response = %*{"kind": "rejected", "reason": proposal.reason,
-            "observation": game.decision(id, seat, retry = true)}
-          stdout.writeLine($response)
-          stdout.flushFile()
-          continue
-        parsed = scriptedAction(view, skBasestock)
-        consumed = true
-      else: parsed = proposal.decision
+        response = %*{"kind": "rejected", "reason": proposal.reason,
+          "observation": game.decision(id, seat, retry = true)}
+        stdout.writeLine($response)
+        stdout.flushFile()
+        continue
+      let parsed = proposal.decision
       let action = if languageMode: decisionJson(parsed) else: %*{"order": parsed.order}
-      game.applyOrder(seat, parsed.order, parsed.say, parsed.notes, consumed)
-      rejectedAttempts = 0
+      game.applyOrder(seat, parsed.order, parsed.say, parsed.notes, false)
       inc id
       var observation: JsonNode
       if game.done:
@@ -159,9 +150,7 @@ when isMainModule:
       else:
         seat = game.pendingSeats()[0]
         observation = game.decision(id, seat)
-      response = %*{"kind": (if consumed: "consumed_rejection" else: "accepted"), "action": action,
-        "observation": observation}
-      if consumed: response["reason"] = %proposal.reason
+      response = %*{"kind": "accepted", "action": action, "observation": observation}
     else:
       raise newException(ValueError, "unknown command: " & request["kind"].getStr())
     stdout.writeLine($response)

@@ -26,7 +26,8 @@ and `notes`. `llm` requires the prestarted complete successful response,
 joined reader, actual raw HTTP evidence, and response text/model equality
 with the received body. Its normal parser result must equal the submitted
 action. Unknown proposals remain excluded from model and teacher labels.
-A rejected order gets one repair; another rejection consumes base-stock.
+A rejected order gets one repair; a second rejection, `fallback` source,
+or missed deadline fails the episode without substituting any synthetic order.
 
 At shutdown, `stop` carries `stop_id`, the latest `decision_id` or null,
 and the remaining `cleanup_budget_ms`. Every registered external owner,

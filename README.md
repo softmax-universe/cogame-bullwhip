@@ -94,13 +94,14 @@ uv run coworld upload-policy <bullwhip image> --name my-bullwhip \
 Hosted model calls use the platform-provided `COWORLD_LLM_ENDPOINT` sidecar.
 `COWORLD_LLM_MODEL` selects the canonical model; `COWORLD_LLM_TEMPERATURE`
 is finite and in [0, 1]. Native calls consume one configured weekly deadline.
-Without an endpoint, the engine uses its explicit base-stock fallback.
+Model seats require `COWORLD_LLM_ENDPOINT` and fail the episode if absent or
+if they fail to submit a valid order after one repair.
 
 For scripted baselines, pass `--secret-env PLAYER_SCRIPTED=basestock` or
 `--secret-env PLAYER_SCRIPTED=mirror` to the same policy upload command.
 
-The game uses base-stock if an external player misses its action deadline.
-It rejects invalid actions.
+The game rejects invalid actions and fails the episode rather than
+substituting a synthetic order when a seat fails or misses its deadline.
 
 ## Episode rules wording
 

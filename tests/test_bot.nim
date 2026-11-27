@@ -78,7 +78,7 @@ suite "scripted baselines":
     check sim.done
     check sim.weeksPlayed == 24
 
-  test "decideAll uses fallback when native endpoint is absent":
+  test "decideAll fails model seats when native endpoint is absent while keeping explicit baselines":
     var credentials: seq[(string, string)]
     for key in ["COWORLD_LLM_ENDPOINT", "AWS_ENDPOINT_URL_BEDROCK_RUNTIME",
         "AWS_BEARER_TOKEN_BEDROCK", "ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI"]:
@@ -91,22 +91,36 @@ suite "scripted baselines":
     check client.disabled
     var sim = initSim(config)
     let seats = sim.pendingSeats()
-    let decisions = client.decideAll(sim, seats,
-      @["be bold", "", "", ""], @[skNone, skNone, skMirror, skNone],
+    let mixed = client.decideAll(sim, seats,
+      @["be bold", "", "", ""], @[skNone, skBasestock, skMirror, skNone],
       getMonoTime() + initDuration(seconds = 1),
       proc(slot: int, attempt: DecisionAttempt) {.gcsafe.} =
         doAssert false, "disabled native client must not start HTTP work")
-    check decisions.len == Seats
+    check mixed.len == Seats
+    check mixed[0].failed and mixed[0].failureReason.len > 0
+    check not mixed[1].failed and mixed[1].order == scriptedAction(sim, seats[1], skBasestock).order
+    check not mixed[2].failed and mixed[2].order == scriptedAction(sim, seats[2], skMirror).order
+    check mixed[3].failed and mixed[3].failureReason.len > 0
+    let explicit = client.decideAll(sim, seats,
+      @["", "", "", ""], @[skBasestock, skMirror, skBasestock, skMirror],
+      getMonoTime() + initDuration(seconds = 1),
+      proc(slot: int, attempt: DecisionAttempt) {.gcsafe.} =
+        doAssert false, "scripted seats must not start HTTP work")
+    check explicit.len == Seats
     for index, seat in seats:
-      let kind = if seat == 2: skMirror else: skBasestock
-      check decisions[index].order == scriptedAction(sim, seat, kind).order
-      sim.applyOrder(seat, decisions[index].order, "", "", true)
+      check not explicit[index].failed
+      let kind = if index mod 2 == 0: skBasestock else: skMirror
+      check explicit[index].order == scriptedAction(sim, seat, kind).order
+      sim.applyOrder(seat, explicit[index].order, "", "", true)
     check sim.week == 1
 
   test "model replies parse through the canonical typed validator":
     let observation = observationJson(initSim(fixture(7)), 0)
-    for (text, expected) in [("{\"order\":7}", 7), ("{\"order\":\"12\"}", 12),
-        ("{\"order\":6.6}", 7), ("{\"order\":\" 9 \"}", 9)]:
+    for (text, expected) in [
+        ("{\"order\":7}", 7),
+        ("  {\"order\": 0}  ", 0),
+        ("```json\n{\"order\":12}\n```", 12),
+        ("```\n{\"order\":9}\n```", 9)]:
       let proposal = parseProposal(text, observation)
       check proposal.kind == pkAccepted
       check proposal.decision.order == expected
@@ -114,8 +128,13 @@ suite "scripted baselines":
     check full.kind == pkAccepted
     check full.decision.say == "demand looks like 8"
     check full.decision.notes == "on order 13"
-    for text in ["{\"order\":-1}", "{\"order\":501}", "{\"order\":\"lots\"}",
-        "{\"notes\":\"no order\"}", "no JSON", "{not valid}", "{\"order\":\"Inf\"}",
+    for text in [
+        "{\"order\":-1}", "{\"order\":501}", "{\"order\":6.6}", "{\"order\":\"12\"}",
+        "{\"order\":\" 9 \"}", "{\"order\":\"lots\"}", "{\"notes\":\"no order\"}",
+        "{\"order\":5,\"say\":123}", "{\"order\":5,\"notes\":[]}",
+        "Here is my order: {\"order\":7}", "{\"order\":7} thanks",
+        "```yaml\n{\"order\":7}\n```", "```json\n{\"order\":7}\n```\nextra",
+        "no JSON", "{not valid}", "{\"order\":\"Inf\"}",
         "{\"order\":15}\n{\"order\":4}\n{\"order\":9}"]:
       check parseProposal(text, observation).kind == pkRejected
     var long = ""
@@ -123,10 +142,12 @@ suite "scripted baselines":
       long.add("é")
     check cleanText(long, MaxNotesLen).runeLen == MaxNotesLen
     check cleanText(long, MaxSayLen).runeLen == MaxSayLen
-    check parseScriptKind("1") == skBasestock
     check parseScriptKind("basestock") == skBasestock
     check parseScriptKind("mirror") == skMirror
     check parseScriptKind("") == skNone
+    for alias in ["1", "true", "yes", "base-stock", "passthrough", "pass-through", "unknown"]:
+      expect(BullwhipError):
+        discard parseScriptKind(alias)
 
   test "prompts carry the seat's own table and nothing hidden":
     var sim = initSim(fixture(7, weeks = 8))
