@@ -60,8 +60,15 @@ its `prompt_wordings` counts before using a mixed corpus; raw wording coverage i
 Historical seed-based exports with prompt seed zero retained only `plain` and
 `questions` in training for seeds 1–10. Seeds 1–20 retained all five training
 wordings, with 1,584 training and 1,296 validation targets across all four seats.
-Those counts do not qualify the physical-demand split. Recompute target counts
-and training-wording coverage for each physically grouped export and target filter.
+For the physical-demand families, the default 20% hash split assigns all
+nine families from seeds 1–10 to training. Use the twenty-seed command below
+when both splits are required. With prompt seed zero, all four seats and the
+scripted basestock teacher, it produced 2,880 accepted decisions across 15
+families. Twelve families contributed 2,304 training decisions across all five
+wordings. Three families (seeds 11, 12, 13 and 18) contributed 576 validation
+decisions: 144 canonical, 144 plain and 288 numbered. The two splits had no
+family in common. These counts precede label admission. Recompute them when
+changing the seed range, prompt seed or target filter.
 
 ```sh
 nim r -d:release --path:src tools/export_posttrain.nim \
