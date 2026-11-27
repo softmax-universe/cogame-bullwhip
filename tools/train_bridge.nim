@@ -92,7 +92,7 @@ when isMainModule:
       id = 0
       seat = game.pendingSeats()[0]
       # Private split audit only: never attach hidden state to a decision.
-      let family = %*{"demand": game.demand}
+      let family = game.physicalScenario()
       auditScenario = %*{"protocol": "coworld.native-scenario-audit.v1",
         "game": "bullwhip", "seed": request["seed"].getStr(),
         "engine_seed": game.config.seed, "family": family}

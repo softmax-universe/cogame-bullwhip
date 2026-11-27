@@ -14,7 +14,15 @@ renderer, teacher policy, and typed action parser drive runtime and export.
 The published player, exporter, and language bridge use the same default
 operator strategy; custom bridge strategies require an explicit argument.
 Each trajectory includes every teacher proposal, applied action, terminal
-scores, immutable source commit, game version, and `bullwhip-<seed>` family.
+scores, immutable source commit, game version, and a physical-demand family.
+The family is `bullwhip-demand-v1-<sha1>` over compact UTF-8 JSON with
+ordered fields `weeks`, `talk`, and `demand` (including terminal-week demand).
+It excludes seed, seat aliases, role permutation, prompt wording, and prompt seed.
+Equivalent demand schedules therefore remain in one split across different seeds.
+The private export manifest retains the exact family input for independent hashing.
+The native server and exporter call the same simulator-owned family function.
+Historical seed-based trajectories remain historical evidence and must not be
+admitted as physically disjoint train/validation data.
 Existing output directories are refused. Output directories use mode 0700;
 private files use 0600. No split or supervised dataset rows are generated here.
 
@@ -49,10 +57,18 @@ is `scripted-basestock`. The review must match the actual attempt policy, source
 revision, game version, and selected seats. Qualification alone does not authorize labels.
 The importer retains generation evidence and owns the scenario-family split. Inspect
 its `prompt_wordings` counts before using a mixed corpus; raw wording coverage is insufficient.
-For prompt seed zero, seeds 1–10 retain only `plain` and `questions` in training under
-the default 20% hash split. Seeds 1–20 retain all five training wordings, with 1,584
-training and 1,296 validation targets across all four seats. Other ranges and target
-filters need their own coverage check.
+Historical seed-based exports with prompt seed zero retained only `plain` and
+`questions` in training for seeds 1–10. Seeds 1–20 retained all five training
+wordings, with 1,584 training and 1,296 validation targets across all four seats.
+For the physical-demand families, the default 20% hash split assigns all
+nine families from seeds 1–10 to training. Use the twenty-seed command below
+when both splits are required. With prompt seed zero, all four seats and the
+scripted basestock teacher, it produced 2,880 accepted decisions across 15
+families. Twelve families contributed 2,304 training decisions across all five
+wordings. Three families (seeds 11, 12, 13 and 18) contributed 576 validation
+decisions: 144 canonical, 144 plain and 288 numbered. The two splits had no
+family in common. These counts precede label admission. Recompute them when
+changing the seed range, prompt seed or target filter.
 
 ```sh
 nim r -d:release --path:src tools/export_posttrain.nim \
@@ -97,7 +113,8 @@ labels. A complete game returns each stage's native negative cost as score.
 The exporter writes `trajectories.jsonl`: complete engine-owned private
 trajectories with exact seat observations, prompts, teacher proposals, applied
 orders, scores, source commit, and game version. Output directories use mode
-0700 and files use 0600. Seed families use `bullwhip-<seed>`, matching runtime.
+0700 and files use 0600. Families use the simulator-owned physical-demand identity
+defined above, matching runtime; distinct seed labels can share one family.
 These local scripted basestock labels do not provide hosted model or learner
 sampling evidence. Review dataset content before training.
 
